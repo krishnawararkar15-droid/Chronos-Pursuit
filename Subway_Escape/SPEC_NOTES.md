@@ -264,3 +264,16 @@ Benchmark results across 10 distinct random seeds (Seeds 1–10):
 3. **Multi-Runner Support**:
    - Practice arena runs 1 runner per team, but schema defines `my_runners` as a list.
    - **Strategy**: Fully vector-matched bipartite assignment table handling $N \ge 1$ runners without race conditions or target collisions.
+
+---
+
+## 8. Rule 6 Verified Facts & Plan Adaptation
+
+| Aspect | Verified Fact | Impact on Plan / Strategy |
+| :--- | :--- | :--- |
+| **Carrying Capacity** | Runner backpack `max_capacity` is 500.0 (received in per-tick state). | Drops can be collected up to capacity limit (`min(capacity - loot, drop_value)`). We can collect multiple drops in a single cycle before returning to a safehouse. |
+| **Runners per Bot** | Practice arena instantiates 1 runner per bot command (`len(my_runners) == 1`). Protocol schema `my_runners` supports arbitrary $N \ge 1$. | Bot logic handles $N=1$ efficiently without overhead, while keeping general bipartite assignment for $N > 1$. |
+| **Bot Interaction** | Bots placed in the same arena run in the **SAME shared world**, competing for the **SAME drops**. They do NOT physically block tracks or runners. First bot to execute `COLLECT` takes the drop. | If an opponent reaches a drop first, our bot's `COLLECT` would fail (invalid action). We must predict travel times and avoid chasing drops that opponents will snatch first, or secure drops faster through optimal routing. |
+| **Score Computation** | `stats.score += runner.loot` strictly upon `DEPOSIT` action while on a safehouse node. Carried loot at tick 300 is worth $0. | Endgame drainage must strictly guarantee all carried loot is banked before tick 300. |
+| **Final Judging Settings** | Official engine details (map generator, police movement, `current_weight` calculation, numbers) are deliberately **unannounced** and differ from practice arena. | Do not overfit to practice arena quirks. Use general geometric risk estimation, dynamic graph lookups from received state, and robust physics prediction. |
+
