@@ -40,6 +40,7 @@ CONFIG: Dict[str, Any] = {
     "enable_chaining": True,
     "chain_max_depth": 3,
     "chain_capacity_cutoff": 450.0,
+    "enable_gated_risk": True,
 }
 
 # Allow external tuning via environment variable without affecting standard runs
@@ -489,25 +490,64 @@ class RiskModel:
     def edge_risk_penalty(self, node_u: Node, node_v: Node, k_arrive: int, carried_loot: float) -> float:
         """
         Computes risk penalty for traversing edge (u, v) arriving at future tick offset k_arrive.
+        Stage 3c: Gated by real danger and carried value.
         """
-        k_step = min(k_arrive, self.H)
-        # Check endpoint node_v at arrival tick
-        hit_v = self.point_hit_risk(node_v.x, node_v.y, k_step)
-        # Check midpoint of edge during transit
-        mid_x = (node_u.x + node_v.x) * 0.5
-        mid_y = (node_u.y + node_v.y) * 0.5
-        hit_mid = self.point_hit_risk(mid_x, mid_y, max(0, k_step - 1))
+        if not CONFIG.get("enable_gated_risk", True):
+            k_step = min(k_arrive, self.H)
+            hit_v = self.point_hit_risk(node_v.x, node_v.y, k_step)
+            mid_x = (node_u.x + node_v.x) * 0.5
+            mid_y = (node_u.y + node_v.y) * 0.5
+            hit_mid = self.point_hit_risk(mid_x, mid_y, max(0, k_step - 1))
+            effective_hit = max(hit_v, hit_mid)
+            if effective_hit <= 0.0:
+                return 0.0
+            if effective_hit >= 0.95:
+                return 1e6
+            expected_loss = (carried_loot + self.stun_cost) * effective_hit
+            return self.penalty_weight * expected_loss
 
-        effective_hit = max(hit_v, hit_mid)
-        if effective_hit <= 0.0:
+        # Stage 3c: Gated Risk Model
+        k_step = min(k_arrive, self.H)
+        loot_ratio = min(1.0, max(0.0, carried_loot / 500.0))
+        # Empty runners accept a tighter safety margin (3.0); loaded runners use a protective margin (7.0)
+        gated_margin = 3.0 + 4.0 * loot_ratio
+
+        max_penetration = 0.0
+        # Check endpoint node_v
+        for cop_id in self._pred_trajectories:
+            cx, cy, radius = self.get_police_pred(cop_id, k_step)
+            d_v = math.hypot(node_v.x - cx, node_v.y - cy)
+            if d_v <= radius:
+                return 1e6  # Direct fatal capture predicted
+            danger_r = radius + gated_margin
+            if d_v < danger_r:
+                pen = 1.0 - (d_v - radius) / gated_margin
+                if pen > max_penetration:
+                    max_penetration = pen
+
+        # Check midpoint of edge during transit
+        if max_penetration < 0.95:
+            mid_x = (node_u.x + node_v.x) * 0.5
+            mid_y = (node_u.y + node_v.y) * 0.5
+            k_mid = max(0, k_step - 1)
+            for cop_id in self._pred_trajectories:
+                cx, cy, radius = self.get_police_pred(cop_id, k_mid)
+                d_m = math.hypot(mid_x - cx, mid_y - cy)
+                if d_m <= radius:
+                    return 1e6
+                danger_r = radius + gated_margin
+                if d_m < danger_r:
+                    pen = 1.0 - (d_m - radius) / gated_margin
+                    if pen > max_penetration:
+                        max_penetration = pen
+
+        if max_penetration <= 0.0:
             return 0.0
 
-        if effective_hit >= 0.95:
-            # Fatal capture predicted
-            return 1e6
-
-        expected_loss = (carried_loot + self.stun_cost) * effective_hit
-        return self.penalty_weight * expected_loss
+        capture_cost = carried_loot + self.stun_cost
+        # Scaled penalty weight: 1.5 when empty, 4.0 when loaded
+        effective_weight = 1.5 + 2.5 * loot_ratio
+        return effective_weight * capture_cost * max_penetration
 
 
 # ============================================================================
