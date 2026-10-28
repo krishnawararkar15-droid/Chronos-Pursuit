@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+debug.log
+Subway_Escape/practice_logs/
+.pytest_cache/
+.coverage
