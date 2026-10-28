@@ -196,5 +196,43 @@ class TestStressSuite(unittest.TestCase):
         self.assertNotEqual(actions[0].get("target_node"), 1)
 
 
+    def test_runner_stunned_at_tick_zero(self):
+        """Runner starts match in STUNNED status: must output HOLD without crashing."""
+        state = {
+            "tick": 0,
+            "graph_nodes": [{"id": 1, "x": 50, "y": 50, "type": "safehouse"}],
+            "graph_edges": [],
+            "my_runners": [{"id": 1, "current_node": 1, "carrying_loot": 0.0, "status": "STUNNED", "stun_ticks_remaining": 3}],
+            "active_money_drops": [],
+            "police_officers": [],
+        }
+        actions = self.engine.step(state)
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["action"], "HOLD")
+
+    def test_maximum_police_speed(self):
+        """Police officer moving at supersonic speed (vx=150, vy=150): risk model must not overflow."""
+        nodes = [
+            {"id": 1, "x": 50.0, "y": 50.0, "type": "safehouse"},
+            {"id": 2, "x": 100.0, "y": 50.0, "type": "junction"},
+        ]
+        edges = [{"from": 1, "to": 2, "base_weight": 50.0, "current_weight": 50.0}]
+        runners = [{"id": 1, "current_node": 1, "carrying_loot": 200.0, "status": "ACTIVE"}]
+        police = [{"id": 1, "x": 0.0, "y": 0.0, "vx": 200.0, "vy": 200.0, "radius": 25.0}]
+        state = {
+            "tick": 10,
+            "graph_nodes": nodes,
+            "graph_edges": edges,
+            "my_runners": runners,
+            "active_money_drops": [],
+            "police_officers": police,
+        }
+        t0 = time.perf_counter()
+        actions = self.engine.step(state)
+        elapsed = time.perf_counter() - t0
+        self.assertEqual(len(actions), 1)
+        self.assertLess(elapsed, 0.35)
+
+
 if __name__ == "__main__":
     unittest.main()

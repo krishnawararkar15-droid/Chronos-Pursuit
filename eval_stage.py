@@ -103,13 +103,18 @@ def compute_paired(new_scores: List[float], old_scores: List[float]) -> Dict[str
 
 def main():
     stage_name = sys.argv[1] if len(sys.argv) > 1 else "Stage_3a"
-    print(f"=== Evaluating {stage_name} across TUNE (seeds 1..20) and VALIDATE (seeds 21..40) ===")
+    baseline_csv = sys.argv[2] if len(sys.argv) > 2 else "eval_results.csv"
+    print(f"=== Evaluating {stage_name} (baseline: {baseline_csv}) across TUNE (seeds 1..20) and VALIDATE (seeds 21..40) ===")
 
-    # Load baseline scores from eval_results.csv
+    # Load baseline scores
     baseline_scores = {}
-    with open(os.path.join(WORKSPACE_DIR, "eval_results.csv"), mode="r", encoding="utf-8") as f:
+    baseline_path = os.path.join(WORKSPACE_DIR, baseline_csv)
+    with open(baseline_path, mode="r", encoding="utf-8") as f:
         for r in csv.DictReader(f):
-            if r["bot"] == "my_bot":
+            if "bot" in r:
+                if r["bot"] == "my_bot":
+                    baseline_scores[int(r["seed"])] = float(r["score"])
+            else:
                 baseline_scores[int(r["seed"])] = float(r["score"])
 
     all_seeds = TUNE_SEEDS + VALIDATE_SEEDS
