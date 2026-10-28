@@ -36,7 +36,20 @@ CONFIG: Dict[str, Any] = {
     "switch_gain": 0.15,
     "endgame_margin": 4,
     "safehouse_congestion_pen": 2.0,
+    "dynamic_bank_coef": 3.2,
+    "enable_chaining": True,
+    "chain_max_depth": 3,
+    "chain_capacity_cutoff": 450.0,
 }
+
+# Allow external tuning via environment variable without affecting standard runs
+_env_cfg = os.environ.get("BOT_CONFIG_JSON")
+if _env_cfg:
+    try:
+        CONFIG.update(json.loads(_env_cfg))
+    except Exception:
+        pass
+
 
 INF = math.inf
 VALID_ACTIONS = {"TRAVERSE", "HOLD", "COLLECT", "DEPOSIT"}
@@ -806,6 +819,149 @@ class BotEngine:
 
         return utility, hops_to_drop, hops_drop_to_safe
 
+    def evaluate_chained_sequences(
+        self,
+        runner: Runner,
+        dist_m: Dict[int, float],
+        prev_m: Dict[int, Optional[int]],
+        world: World,
+        reserved_drop_ids: Set[int],
+    ) -> List[Tuple[float, int, int]]:
+        """
+        Stage 3a: Multi-drop chaining by rate.
+        Evaluates short sequences (1, 2, or 3 drops) followed by best safehouse.
+        Returns candidate list of (rate_of_return, drop_id, hops_to_drop).
+        """
+        if not CONFIG.get("enable_chaining", True):
+            return []
+
+        cands = [d for d in world.drops if d.node_id != runner.current_node and d.drop_id not in reserved_drop_ids]
+        if not cands:
+            return []
+
+        max_cap = runner.max_capacity
+        curr_loot = runner.carrying_loot
+        capacity_cutoff = CONFIG.get("chain_capacity_cutoff", 450.0)
+        max_depth = CONFIG.get("chain_max_depth", 3)
+        # Adapt depth on massive graphs (e.g. 1000 nodes) to strictly respect 350ms budget
+        if len(world.nodes) > 150:
+            max_depth = 1
+        ticks_left = world.ticks_left
+
+        hops_cache: Dict[Tuple[int, int], int] = {}
+
+        def get_hops(u: int, v: int) -> int:
+            if u == v:
+                return 0
+            key = (u, v)
+            if key in hops_cache:
+                return hops_cache[key]
+            p = self.graph_engine.path(u, v)
+            h = len(p) - 1 if p else 999
+            hops_cache[key] = h
+            return h
+
+        # Pre-cache static paths from all safehouses: O(1) lookup for any node!
+        safe_maps: List[Tuple[int, Dict[int, float], Dict[int, Optional[int]]]] = []
+        for s in world.safehouses:
+            s_dist, s_prev = self.graph_engine.get_static_paths(s)
+            safe_maps.append((s, s_dist, s_prev))
+
+        def get_nearest_safe_hops(u: int) -> Tuple[Optional[int], int]:
+            best_s = None
+            min_h = 999
+            for s, s_dist, s_prev in safe_maps:
+                if u in s_dist and s_dist[u] != INF:
+                    p = self.graph_engine.path(s, u, prev=s_prev)
+                    h = len(p) - 1 if p else 999
+                    if h < min_h:
+                        min_h = h
+                        best_s = s
+            return best_s, min_h
+
+        single_drop_rates: List[Tuple[float, Drop, int, float]] = []
+        for d1 in cands:
+            if d1.node_id not in dist_m or dist_m[d1.node_id] == INF:
+                continue
+            p1 = self.graph_engine.path(runner.current_node, d1.node_id, prev=prev_m)
+            if not p1:
+                continue
+            h1 = len(p1) - 1
+            if h1 <= 0 or h1 >= d1.ttl_remaining or (h1 + 2 > ticks_left):
+                continue
+            v1_arr = d1.current_value * math.exp(-d1.leak_lambda * h1)
+            take1 = min(max_cap - curr_loot, v1_arr)
+            if take1 <= 0:
+                continue
+            _, h_safe1 = get_nearest_safe_hops(d1.node_id)
+            total_t1 = h1 + 1 + h_safe1 + 1
+            if total_t1 > ticks_left:
+                continue
+            rate1 = (curr_loot + take1) / total_t1
+            single_drop_rates.append((rate1, d1, h1, take1))
+
+        if not single_drop_rates:
+            return []
+
+        single_drop_rates.sort(key=lambda x: x[0], reverse=True)
+        top_candidates = [item[1] for item in single_drop_rates[:6]]
+
+        sequence_evals: Dict[int, float] = {}
+        hops_to_first: Dict[int, int] = {}
+
+        for rate1, d1, h1, take1 in single_drop_rates[:6]:
+            sequence_evals[d1.drop_id] = rate1
+            hops_to_first[d1.drop_id] = h1
+
+            if max_depth >= 2 and (curr_loot + take1) < capacity_cutoff and ticks_left > 15:
+                for d2 in top_candidates:
+                    if d2.drop_id == d1.drop_id:
+                        continue
+                    h2 = get_hops(d1.node_id, d2.node_id)
+                    if h2 >= 999:
+                        continue
+                    t2_arr = h1 + 1 + h2
+                    if t2_arr >= d2.ttl_remaining or (t2_arr + 2 > ticks_left):
+                        continue
+                    v2_arr = d2.current_value * math.exp(-d2.leak_lambda * t2_arr)
+                    take2 = min(max_cap - (curr_loot + take1), v2_arr)
+                    if take2 <= 0:
+                        continue
+                    _, h_safe2 = get_nearest_safe_hops(d2.node_id)
+                    total_t2 = t2_arr + 1 + h_safe2 + 1
+                    if total_t2 > ticks_left:
+                        continue
+                    rate2 = (curr_loot + take1 + take2) / total_t2
+                    if rate2 > sequence_evals[d1.drop_id]:
+                        sequence_evals[d1.drop_id] = rate2
+
+                    if max_depth >= 3 and (curr_loot + take1 + take2) < capacity_cutoff and ticks_left > 25:
+                        for d3 in top_candidates:
+                            if d3.drop_id == d1.drop_id or d3.drop_id == d2.drop_id:
+                                continue
+                            h3 = get_hops(d2.node_id, d3.node_id)
+                            if h3 >= 999:
+                                continue
+                            t3_arr = t2_arr + 1 + h3
+                            if t3_arr >= d3.ttl_remaining or (t3_arr + 2 > ticks_left):
+                                continue
+                            v3_arr = d3.current_value * math.exp(-d3.leak_lambda * t3_arr)
+                            take3 = min(max_cap - (curr_loot + take1 + take2), v3_arr)
+                            if take3 <= 0:
+                                continue
+                            _, h_safe3 = get_nearest_safe_hops(d3.node_id)
+                            total_t3 = t3_arr + 1 + h_safe3 + 1
+                            if total_t3 > ticks_left:
+                                continue
+                            rate3 = (curr_loot + take1 + take2 + take3) / total_t3
+                            if rate3 > sequence_evals[d1.drop_id]:
+                                sequence_evals[d1.drop_id] = rate3
+
+        results: List[Tuple[float, int, int]] = []
+        for did, best_rate in sequence_evals.items():
+            results.append((best_rate, did, hops_to_first[did]))
+        return results
+
     def bank_now_test(
         self,
         runner: Runner,
@@ -832,7 +988,7 @@ class BotEngine:
         # High lambda -> bank earlier, Low lambda -> bank later
         dynamic_threshold = max(
             CONFIG["bank_threshold_min"],
-            min(CONFIG["bank_threshold_max"], 3.2 / max(0.005, avg_lambda))
+            min(CONFIG["bank_threshold_max"], CONFIG.get("dynamic_bank_coef", 3.2) / max(0.005, avg_lambda))
         )
         if carrying >= dynamic_threshold or carrying >= capacity * 0.95:
             return True
@@ -913,15 +1069,22 @@ class BotEngine:
             dist_m, prev_m = runner_maps[rid]
 
             if runner.carrying_loot < runner.max_capacity:
-                for drop in world.drops:
-                    if drop.node_id == runner.current_node or drop.drop_id in reserved_drop_ids:
-                        continue
-                    util, hops_drop, hops_safe = self.compute_drop_utility(runner, drop, dist_m, prev_m, world)
-                    if util > 0.0:
-                        # Apply hysteresis boost if drop was targeted in previous tick
-                        if drop.drop_id == self.runner_prev_drop.get(rid):
+                # Stage 3a: Multi-drop chaining evaluation
+                chain_candidates = self.evaluate_chained_sequences(runner, dist_m, prev_m, world, reserved_drop_ids)
+                if chain_candidates:
+                    for util, did, hops_drop in chain_candidates:
+                        if did == self.runner_prev_drop.get(rid):
                             util *= (1.0 + CONFIG["switch_gain"])
-                        candidate_pairings.append((util, rid, drop.drop_id, hops_drop))
+                        candidate_pairings.append((util, rid, did, hops_drop))
+                else:
+                    for drop in world.drops:
+                        if drop.node_id == runner.current_node or drop.drop_id in reserved_drop_ids:
+                            continue
+                        util, hops_drop, hops_safe = self.compute_drop_utility(runner, drop, dist_m, prev_m, world)
+                        if util > 0.0:
+                            if drop.drop_id == self.runner_prev_drop.get(rid):
+                                util *= (1.0 + CONFIG["switch_gain"])
+                            candidate_pairings.append((util, rid, drop.drop_id, hops_drop))
 
         # Sort candidate pairings by effective utility descending (Greedy Bipartite Matching)
         candidate_pairings.sort(key=lambda item: item[0], reverse=True)

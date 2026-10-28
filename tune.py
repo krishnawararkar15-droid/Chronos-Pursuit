@@ -1,192 +1,334 @@
 #!/usr/bin/env python3
 """
-Parameter Tuning and Optimization Harness for Phase 8:
-Conducts randomized parameter search across candidate CONFIG spaces.
-Evaluates candidates using the official PracticeArena over train seeds and tests on held-out seeds.
-Ranks candidates via robust fitness: mean - 0.5 * std (maximizing score while minimizing variance).
-Freezes the winning config into submission/my_bot.py and my_bot.py.
+Subway Escape - Stage 2 Parameter Sweep (tune.py)
+Systematically evaluates hypothesis configs against baseline v1-safe.
+Rules:
+  - TUNE = seeds 1..20
+  - VALIDATE = seeds 21..40
+  - Top 5 selected by (mean - 0.5 * std) on TUNE
+  - Evaluated on VALIDATE with paired differences
+  - Acceptance gated by Rule 4
 """
 
-import concurrent.futures
+import argparse
+import csv
 import json
 import math
 import os
-import random
-import re
 import statistics
+import subprocess
 import sys
-import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, List, Tuple
 
-ARENA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "practice_arena"))
-if ARENA_DIR not in sys.path:
-    sys.path.insert(0, ARENA_DIR)
+WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
+KIT_DIR = os.path.join(WORKSPACE_DIR, "Subway_Escape")
+ARENA_SCRIPT = os.path.join(KIT_DIR, "practice_arena", "run_practice.py")
+MY_BOT_PATH = os.path.join(KIT_DIR, "submission", "my_bot.py")
+SAMPLE_BOT_PATH = os.path.join(KIT_DIR, "sample_bot", "python", "basic_bot.py")
 
-from practice_arena import PracticeArena, TOTAL_TICKS
+TUNE_SEEDS = list(range(1, 21))
+VALIDATE_SEEDS = list(range(21, 41))
 
 
-def run_candidate_match(args: Tuple[int, str, Dict[str, Any], int]) -> Tuple[int, float, int, float]:
-    seed, bot_path, config_overrides, ticks = args
-    # Use environment variable to pass config overrides to the bot process
+def run_single_seed(seed: int, config_json: str, worker_id: int = 0) -> Dict[str, Any]:
+    """Runs a single match between my_bot (with config) and sample_bot on a given seed."""
     env = os.environ.copy()
-    env["SUBWAY_CONFIG_OVERRIDE"] = json.dumps(config_overrides)
+    env["BOT_CONFIG_JSON"] = config_json
 
-    # Launch arena with the bot command
-    arena = PracticeArena([[sys.executable, bot_path]], seed=seed, ticks=ticks, verbose=False, log_dir="practice_logs")
-    # Set env on process
-    for cmd in arena.commands.values():
-        pass
-    stats = arena.run()
-    bot_stat = stats[1]
-    return seed, bot_stat.score, bot_stat.captures, bot_stat.loot_lost
+    log_dir = os.path.join(KIT_DIR, "practice_logs", f"w{worker_id}")
+    os.makedirs(log_dir, exist_ok=True)
+
+    cmd = [
+        sys.executable,
+        ARENA_SCRIPT,
+        "--bot", f'"{sys.executable}" "{MY_BOT_PATH}"',
+        "--bot", f'"{sys.executable}" "{SAMPLE_BOT_PATH}"',
+        "--runs", "1",
+        "--seed", str(seed),
+        "--ticks", "300",
+        "--log-dir", log_dir,
+    ]
+
+    proc = subprocess.run(
+        cmd,
+        cwd=KIT_DIR,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+
+    out = proc.stdout
+    lines = out.strip().splitlines()
+    in_table = False
+    my_bot_stats = {
+        "seed": seed,
+        "score": 0.0,
+        "collected": 0.0,
+        "deposits": 0.0,
+        "caught": 0.0,
+        "loot_lost": 0.0,
+        "bad_acts": 0.0,
+        "misses": 0.0,
+        "avg_ms": 0.0,
+        "max_ms": 0.0,
+        "sample_score": 0.0,
+    }
+
+    for line in lines:
+        line_str = line.strip()
+        if line_str.startswith("Bot") and "Score" in line_str and "Collected" in line_str:
+            in_table = True
+            continue
+        if in_table and line_str.startswith("---"):
+            continue
+        if in_table:
+            if not line_str or line_str.startswith("Columns:"):
+                break
+            parts = line_str.split()
+            if len(parts) >= 10:
+                is_my_bot = "my_bot" in parts[0]
+                try:
+                    score = float(parts[1].replace(",", "").replace("$", ""))
+                    if is_my_bot:
+                        my_bot_stats["score"] = score
+                        my_bot_stats["collected"] = float(parts[2].replace(",", ""))
+                        my_bot_stats["deposits"] = float(parts[3].replace(",", ""))
+                        my_bot_stats["caught"] = float(parts[4].replace(",", ""))
+                        my_bot_stats["loot_lost"] = float(parts[5].replace(",", "").replace("$", ""))
+                        my_bot_stats["bad_acts"] = float(parts[6].replace(",", ""))
+                        my_bot_stats["misses"] = float(parts[7].replace(",", ""))
+                        my_bot_stats["avg_ms"] = float(parts[8].replace(",", ""))
+                        my_bot_stats["max_ms"] = float(parts[9].replace(",", ""))
+                    else:
+                        my_bot_stats["sample_score"] = score
+                except ValueError:
+                    pass
+
+    return my_bot_stats
 
 
-def evaluate_config(
-    bot_path: str,
-    config: Dict[str, Any],
-    seeds: List[int],
-    workers: int = 4,
-) -> Dict[str, float]:
-    tasks = [(s, bot_path, config, TOTAL_TICKS) for s in seeds]
-    scores = []
-    captures = []
-    loot_lost = []
+def evaluate_config(name: str, cfg: Dict[str, Any], seeds: List[int], max_workers: int = 4) -> Dict[str, Any]:
+    cfg_json = json.dumps(cfg)
+    results = []
 
-    # Run in parallel
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(seeds))) as executor:
-        for seed, score, cap, lost in executor.map(run_candidate_match, tasks):
-            scores.append(score)
-            captures.append(cap)
-            loot_lost.append(lost)
+    # Run seeds in parallel
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(run_single_seed, s, cfg_json, i % max_workers): s for i, s in enumerate(seeds)}
+        for fut in as_completed(futures):
+            res = fut.result()
+            results.append(res)
 
-    mean_s = statistics.mean(scores)
-    std_s = statistics.stdev(scores) if len(scores) > 1 else 0.0
-    fitness = mean_s - 0.5 * std_s
+    results.sort(key=lambda r: r["seed"])
+    scores = [r["score"] for r in results]
+    mean_sc = statistics.mean(scores)
+    std_sc = statistics.stdev(scores) if len(scores) > 1 else 0.0
+    metric = mean_sc - 0.5 * std_sc
 
     return {
-        "mean_score": mean_s,
-        "median_score": statistics.median(scores),
-        "std_score": std_s,
-        "fitness": fitness,
-        "mean_captures": statistics.mean(captures),
-        "mean_loot_lost": statistics.mean(loot_lost),
+        "name": name,
+        "config": cfg,
+        "seeds": seeds,
+        "results": results,
+        "scores": scores,
+        "mean": mean_sc,
+        "std": std_sc,
+        "metric": metric,
+        "caught": statistics.mean([r["caught"] for r in results]),
+        "bad_acts": statistics.mean([r["bad_acts"] for r in results]),
+        "misses": statistics.mean([r["misses"] for r in results]),
+        "max_ms": max([r["max_ms"] for r in results]),
     }
 
 
-def generate_candidate_configs(num_candidates: int = 6) -> List[Dict[str, Any]]:
-    rng = random.Random(2026)
-    candidates = []
-
-    # Baseline configuration as Candidate 0
-    candidates.append({
-        "bank_threshold_min": 180.0,
-        "bank_threshold_max": 420.0,
-        "risk_lookahead_H": 15,
-        "risk_safety_margin": 8.0,
-        "risk_penalty_weight": 6.0,
-        "switch_gain": 0.15,
-        "endgame_margin": 4,
-        "safehouse_congestion_pen": 2.0,
-    })
-
-    # Sample randomized variations
-    for _ in range(num_candidates - 1):
-        cand = {
-            "bank_threshold_min": round(rng.uniform(160.0, 210.0), 1),
-            "bank_threshold_max": round(rng.uniform(390.0, 460.0), 1),
-            "risk_lookahead_H": rng.choice([12, 14, 15, 16]),
-            "risk_safety_margin": round(rng.uniform(7.0, 10.0), 1),
-            "risk_penalty_weight": round(rng.uniform(5.0, 7.5), 1),
-            "switch_gain": round(rng.uniform(0.12, 0.20), 2),
-            "endgame_margin": rng.choice([3, 4, 5]),
-            "safehouse_congestion_pen": round(rng.uniform(1.5, 2.5), 1),
-        }
-        candidates.append(cand)
-
-    return candidates
-
-
-def update_bot_config(file_path: str, best_config: Dict[str, Any]) -> None:
-    """Updates the CONFIG dictionary in the bot file."""
-    with open(file_path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    # Format new config dictionary string
-    new_cfg_lines = ["CONFIG: Dict[str, Any] = {"]
-    new_cfg_lines.append('    "total_ticks": 300,')
-    new_cfg_lines.append('    "tick_budget_s": 0.35,')
-    new_cfg_lines.append('    "debug_log_ticks": 5,')
-    new_cfg_lines.append('    "debug_log_path": "debug.log",')
-    new_cfg_lines.append('    "log_timing": False,')
-    new_cfg_lines.append(f'    "risk_lookahead_H": {best_config["risk_lookahead_H"]},')
-    new_cfg_lines.append(f'    "risk_safety_margin": {best_config["risk_safety_margin"]},')
-    new_cfg_lines.append(f'    "risk_penalty_weight": {best_config["risk_penalty_weight"]},')
-    new_cfg_lines.append('    "avg_income_per_tick": 70.0,')
-    new_cfg_lines.append(f'    "bank_threshold_min": {best_config["bank_threshold_min"]},')
-    new_cfg_lines.append(f'    "bank_threshold_max": {best_config["bank_threshold_max"]},')
-    new_cfg_lines.append('    "opportunistic_bank_dist": 1,')
-    new_cfg_lines.append('    "min_opportunistic_loot": 50.0,')
-    new_cfg_lines.append(f'    "switch_gain": {best_config["switch_gain"]},')
-    new_cfg_lines.append(f'    "endgame_margin": {best_config["endgame_margin"]},')
-    new_cfg_lines.append(f'    "safehouse_congestion_pen": {best_config["safehouse_congestion_pen"]},')
-    new_cfg_lines.append("}")
-    new_cfg_str = "\n".join(new_cfg_lines)
-
-    # Regex replace CONFIG dict
-    pattern = r"CONFIG:\s*Dict\[str,\s*Any\]\s*=\s*\{.*?\}"
-    updated_content = re.sub(pattern, new_cfg_str, content, flags=re.DOTALL)
-
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(updated_content)
+def compute_paired_stats(new_scores: List[float], baseline_scores: List[float]) -> Dict[str, Any]:
+    diffs = [n - b for n, b in zip(new_scores, baseline_scores)]
+    n = len(diffs)
+    mean_diff = statistics.mean(diffs)
+    median_diff = statistics.median(diffs)
+    std_diff = statistics.stdev(diffs) if n > 1 else 0.0
+    se = std_diff / math.sqrt(n) if n > 1 else 0.0
+    ci_95 = 1.96 * se
+    improved = sum(1 for d in diffs if d > 0)
+    worsened = sum(1 for d in diffs if d < 0)
+    tied = sum(1 for d in diffs if d == 0)
+    return {
+        "mean_diff": mean_diff,
+        "median_diff": median_diff,
+        "std_diff": std_diff,
+        "ci_low": mean_diff - ci_95,
+        "ci_high": mean_diff + ci_95,
+        "improved": improved,
+        "worsened": worsened,
+        "tied": tied,
+        "diffs": diffs,
+    }
 
 
 def main():
-    bot_path = "submission/my_bot.py"
-    train_seeds = list(range(1, 11))      # Seeds 1..10
-    val_seeds = list(range(11, 21))       # Held-out Seeds 11..20
+    parser = argparse.ArgumentParser(description="Stage 2 Parameter Sweep")
+    parser.add_argument("--workers", type=int, default=4, help="Parallel worker processes")
+    args = parser.parse_args()
 
-    print("=====================================================================")
-    print("PHASE 8: HYPERPARAMETER TUNING & ROBUSTNESS SWEEP")
-    print(f"Train Seeds: {train_seeds}")
-    print(f"Validation (Held-Out) Seeds: {val_seeds}")
-    print("=====================================================================")
+    # Load baseline scores from eval_results.csv
+    baseline_tune_scores = {}
+    baseline_val_scores = {}
+    csv_file = os.path.join(WORKSPACE_DIR, "eval_results.csv")
+    if os.path.exists(csv_file):
+        with open(csv_file, mode="r", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                if r["bot"] == "my_bot":
+                    s = int(r["seed"])
+                    sc = float(r["score"])
+                    if s <= 20:
+                        baseline_tune_scores[s] = sc
+                    elif 21 <= s <= 40:
+                        baseline_val_scores[s] = sc
 
-    candidates = generate_candidate_configs(num_candidates=5)
+    b_tune_list = [baseline_tune_scores[s] for s in TUNE_SEEDS]
+    b_val_list = [baseline_val_scores[s] for s in VALIDATE_SEEDS]
 
-    best_fitness = -1e9
-    best_candidate = None
-    best_val_stats = None
+    print("=" * 85)
+    print("STAGE 2: PARAMETER SWEEP ON TUNE SET (SEEDS 1..20)")
+    print(f"Baseline TUNE mean: ${statistics.mean(b_tune_list):,.1f} | VAL mean: ${statistics.mean(b_val_list):,.1f}")
+    print("=" * 85)
 
-    for idx, cand in enumerate(candidates):
-        print(f"\n--- Testing Candidate {idx+1}/{len(candidates)} on Training Seeds ---")
-        print(f"Config: {json.dumps(cand, indent=2)}")
+    # Hypothesis configs to test
+    candidates = [
+        ("C0_baseline", {
+            "bank_threshold_min": 180.0, "bank_threshold_max": 420.0,
+            "risk_penalty_weight": 6.0, "risk_safety_margin": 8.0,
+            "endgame_margin": 4, "dynamic_bank_coef": 3.2
+        }),
+        ("C1_bank_300", {
+            "bank_threshold_min": 300.0, "bank_threshold_max": 440.0,
+            "risk_penalty_weight": 6.0, "risk_safety_margin": 8.0,
+            "endgame_margin": 4, "dynamic_bank_coef": 3.2
+        }),
+        ("C2_bank_350", {
+            "bank_threshold_min": 350.0, "bank_threshold_max": 460.0,
+            "risk_penalty_weight": 6.0, "risk_safety_margin": 8.0,
+            "endgame_margin": 4, "dynamic_bank_coef": 3.2
+        }),
+        ("C3_bank_380", {
+            "bank_threshold_min": 380.0, "bank_threshold_max": 470.0,
+            "risk_penalty_weight": 6.0, "risk_safety_margin": 8.0,
+            "endgame_margin": 4, "dynamic_bank_coef": 3.2
+        }),
+        ("C4_risk_3.5", {
+            "bank_threshold_min": 180.0, "bank_threshold_max": 420.0,
+            "risk_penalty_weight": 3.5, "risk_safety_margin": 8.0,
+            "endgame_margin": 4, "dynamic_bank_coef": 3.2
+        }),
+        ("C5_risk_2.5", {
+            "bank_threshold_min": 180.0, "bank_threshold_max": 420.0,
+            "risk_penalty_weight": 2.5, "risk_safety_margin": 6.0,
+            "endgame_margin": 4, "dynamic_bank_coef": 3.2
+        }),
+        ("C6_bank340_risk3.5", {
+            "bank_threshold_min": 340.0, "bank_threshold_max": 460.0,
+            "risk_penalty_weight": 3.5, "risk_safety_margin": 7.0,
+            "endgame_margin": 4, "dynamic_bank_coef": 3.2
+        }),
+        ("C7_bank360_risk3.5", {
+            "bank_threshold_min": 360.0, "bank_threshold_max": 460.0,
+            "risk_penalty_weight": 3.5, "risk_safety_margin": 7.0,
+            "endgame_margin": 4, "dynamic_bank_coef": 3.4
+        }),
+        ("C8_bank380_risk3.0", {
+            "bank_threshold_min": 380.0, "bank_threshold_max": 470.0,
+            "risk_penalty_weight": 3.0, "risk_safety_margin": 6.5,
+            "endgame_margin": 4, "dynamic_bank_coef": 3.5
+        }),
+        ("C9_bank350_risk4.0_end3", {
+            "bank_threshold_min": 350.0, "bank_threshold_max": 460.0,
+            "risk_penalty_weight": 4.0, "risk_safety_margin": 7.5,
+            "endgame_margin": 3, "dynamic_bank_coef": 3.2
+        }),
+        ("C10_bank360_risk3.5_end5", {
+            "bank_threshold_min": 360.0, "bank_threshold_max": 460.0,
+            "risk_penalty_weight": 3.5, "risk_safety_margin": 7.0,
+            "endgame_margin": 5, "dynamic_bank_coef": 3.4
+        }),
+        ("C11_bank400_risk3.5", {
+            "bank_threshold_min": 400.0, "bank_threshold_max": 480.0,
+            "risk_penalty_weight": 3.5, "risk_safety_margin": 7.0,
+            "endgame_margin": 4, "dynamic_bank_coef": 3.6
+        }),
+    ]
 
-        # Temporary write config to bot
-        update_bot_config(bot_path, cand)
+    tune_evals = []
+    print(f"{'Config Name':<22} | {'TUNE Mean':>10} | {'TUNE Std':>9} | {'Metric (u-0.5s)':>15} | {'Caught':>6} | {'BadActs':>7} | {'MaxMs':>5}")
+    print("-" * 88)
 
-        train_res = evaluate_config(bot_path, cand, train_seeds, workers=4)
-        print(f"Train Result: Mean=${train_res['mean_score']:,.0f} | Std=${train_res['std_score']:,.0f} | Fitness={train_res['fitness']:,.0f} | Captures={train_res['mean_captures']:.2f}")
+    for name, cfg in candidates:
+        ev = evaluate_config(name, cfg, TUNE_SEEDS, max_workers=args.workers)
+        tune_evals.append(ev)
+        print(f"{name:<22} | ${ev['mean']:>9.1f} | ${ev['std']:>8.1f} | ${ev['metric']:>14.1f} | {ev['caught']:>6.2f} | {ev['bad_acts']:>7.2f} | {ev['max_ms']:>5.0f}")
 
-        # Evaluate on validation held-out seeds
-        val_res = evaluate_config(bot_path, cand, val_seeds, workers=4)
-        print(f"Validation Result: Mean=${val_res['mean_score']:,.0f} | Std=${val_res['std_score']:,.0f} | Fitness={val_res['fitness']:,.0f} | Captures={val_res['mean_captures']:.2f}")
+    # Sort by metric (mean - 0.5 * std)
+    tune_evals.sort(key=lambda x: x["metric"], reverse=True)
+    top_5 = tune_evals[:5]
 
-        if val_res["fitness"] > best_fitness:
-            best_fitness = val_res["fitness"]
-            best_candidate = cand
-            best_val_stats = val_res
-            print(">>> NEW BEST CANDIDATE FOUND! <<<")
+    print("\n" + "=" * 88)
+    print("TOP 5 CONFIGURATIONS SELECTED BY (u - 0.5s) -> RE-EVALUATING ON VALIDATE (SEEDS 21..40)")
+    print("=" * 88)
 
-    print("\n=====================================================================")
-    print("TUNING COMPLETE — BEST ROBUST CONFIGURATION")
-    print("=====================================================================")
-    print(f"Best Config:\n{json.dumps(best_candidate, indent=2)}")
-    print(f"Held-out Validation Score: ${best_val_stats['mean_score']:,.0f} (Fitness: {best_val_stats['fitness']:,.0f})")
+    val_evals = []
+    for rank, ev in enumerate(top_5, start=1):
+        name = ev["name"]
+        cfg = ev["config"]
+        val_ev = evaluate_config(name, cfg, VALIDATE_SEEDS, max_workers=args.workers)
+        
+        # Paired statistics against baseline
+        tune_paired = compute_paired_stats(ev["scores"], b_tune_list)
+        val_paired = compute_paired_stats(val_ev["scores"], b_val_list)
 
-    # Freeze best candidate into bot files
-    update_bot_config("submission/my_bot.py", best_candidate)
-    update_bot_config("../my_bot.py", best_candidate)
-    print("Successfully froze best configuration into submission/my_bot.py and my_bot.py.")
+        val_evals.append({
+            "rank": rank,
+            "name": name,
+            "config": cfg,
+            "tune_ev": ev,
+            "val_ev": val_ev,
+            "tune_paired": tune_paired,
+            "val_paired": val_paired,
+        })
+
+    print(f"\n{'Rank':<4} | {'Name':<20} | {'TUNE Mean':>9} | {'TUNE Diff (95% CI)':>22} | {'VAL Mean':>9} | {'VAL Diff (95% CI)':>22} | {'VAL Imp/Wor':>11}")
+    print("-" * 110)
+    for ve in val_evals:
+        tp = ve["tune_paired"]
+        vp = ve["val_paired"]
+        t_ci = f"+${tp['mean_diff']:,.0f} [+-${1.96*tp['std_diff']/math.sqrt(20):,.0f}]"
+        v_ci = f"+${vp['mean_diff']:,.0f} [+-${1.96*vp['std_diff']/math.sqrt(20):,.0f}]" if vp['mean_diff'] >= 0 else f"-${abs(vp['mean_diff']):,.0f} [+-${1.96*vp['std_diff']/math.sqrt(20):,.0f}]"
+        imp_wor = f"{vp['improved']}/{vp['worsened']}"
+        print(f"#{ve['rank']:<3} | {ve['name']:<20} | ${ve['tune_ev']['mean']:>8.1f} | {t_ci:>22} | ${ve['val_ev']['mean']:>8.1f} | {v_ci:>22} | {imp_wor:>11}")
+
+    # Check Rule 4 on the best candidate
+    best = val_evals[0]
+    rule4_pass = (
+        best["val_paired"]["mean_diff"] > 0
+        and best["tune_paired"]["improved"] > best["tune_paired"]["worsened"]
+        and best["val_ev"]["caught"] <= 0.05
+        and best["val_ev"]["bad_acts"] == 0.0
+        and best["val_ev"]["misses"] == 0.0
+    )
+
+    print("\n" + "=" * 88)
+    print("RULE 4 ACCEPTANCE GATEWAY CHECK FOR TOP CANDIDATE:", best["name"])
+    print(f"  * VALIDATE Mean Diff > 0:       {best['val_paired']['mean_diff']:+.1f} -> {'PASS' if best['val_paired']['mean_diff'] > 0 else 'FAIL'}")
+    print(f"  * TUNE Improved > Worsened:    {best['tune_paired']['improved']} > {best['tune_paired']['worsened']} -> {'PASS' if best['tune_paired']['improved'] > best['tune_paired']['worsened'] else 'FAIL'}")
+    print(f"  * Caught <= 0.05:              {best['val_ev']['caught']:.2f} -> PASS")
+    print(f"  * BadActs == 0, Misses == 0:   {best['val_ev']['bad_acts']:.2f}, {best['val_ev']['misses']:.2f} -> PASS")
+    print(f"  * Verdict:                     {'ACCEPTED' if rule4_pass else 'REJECTED'}")
+    print("=" * 88)
+
+    if rule4_pass:
+        print("\nFreezing winning configuration:")
+        print(json.dumps(best["config"], indent=2))
+        with open("best_config.json", "w") as f:
+            json.dump(best["config"], f, indent=2)
 
 
 if __name__ == "__main__":
