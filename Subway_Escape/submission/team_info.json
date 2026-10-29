@@ -1,13 +1,11 @@
 {
-  "team_name": "YOUR TEAM NAME",
-  "team_id": "FILL IN THE ID GIVEN BY THE ORGANISERS",
+  "team_name": "krishnawararkar15",
+  "team_id": "1776819",
   "members": [
-    { "name": "Member 1 full name", "email": "member1@example.com" },
-    { "name": "optional", "email": "NA" }
+    { "name": "Krishna Wararkar", "email": "krishnawararkar15@gmail.com" }
   ],
   "language": "python",
   "entry_file": "my_bot.py",
   "build_command": "",
   "run_command": "python my_bot.py"
 }
-
