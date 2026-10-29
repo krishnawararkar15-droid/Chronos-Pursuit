@@ -23,7 +23,8 @@ CONFIG: Dict[str, Any] = {
     "tick_budget_s": 0.35,
     "soft_time_limit_s": 0.20,     # Stage F: 200ms soft limit for planning
     "hard_time_limit_s": 0.35,     # Stage F: 350ms hard limit for immediate safe fallback
-    "debug_log_ticks": 5,
+    "enable_file_logging": False,
+    "debug_log_ticks": 0,
     "debug_log_path": "debug.log",
     "log_timing": False,
     "verbose_stderr": False,       # Keep stderr clean and fast during official matches
@@ -1426,7 +1427,7 @@ class BotEngine:
         tick = _safe_int(raw_tick, 0)
 
         # Log raw incoming state for first N ticks for debugging
-        if 0 <= tick < CONFIG["debug_log_ticks"]:
+        if CONFIG.get("enable_file_logging", False) and 0 <= tick < CONFIG.get("debug_log_ticks", 0):
             try:
                 mode = "w" if tick == 0 else "a"
                 with open(CONFIG["debug_log_path"], mode, encoding="utf-8") as f:
