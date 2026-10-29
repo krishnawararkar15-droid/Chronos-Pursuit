@@ -1,226 +1,206 @@
 #!/usr/bin/env python3
 """
-Evaluation script for Subway Escape bot comparison.
-Runs our bot vs sample_bot across map seeds.
-Saves CSV with per-seed metrics:
-  seed,set,bot,score,collected,deposits,caught,loot_lost,bad_acts,misses,max_ms,disqualified
-Splits seeds into:
-  - tuning set: seeds 1..20
-  - held-out set: seeds 21..40
-Prints statistics (mean, median, min, max, std) for both sets.
+Parallel Evaluation Harness for Subway Escape Bots
+Supports:
+  - TUNE (seeds 1-80)
+  - VALIDATE (seeds 81-160)
+  - FINAL (seeds 161-240)
+  - Paired per-seed differences with 95% CI
+  - Solo mode and Head-to-Head mode
+  - Time per sweep reporting
+  - Integrity metrics: Caught, LootLost, BadActs, Misses, MaxMs
 """
 
 import argparse
+import concurrent.futures
 import csv
+import json
 import math
 import os
 import statistics
-import subprocess
 import sys
-from collections import defaultdict
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
-# Root directories
 WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
 KIT_DIR = os.path.join(WORKSPACE_DIR, "Subway_Escape")
-ARENA_SCRIPT = os.path.join(KIT_DIR, "practice_arena", "run_practice.py")
-MY_BOT_PATH = os.path.join(KIT_DIR, "submission", "my_bot.py")
-SAMPLE_BOT_PATH = os.path.join(KIT_DIR, "sample_bot", "python", "basic_bot.py")
+if os.path.join(KIT_DIR, "practice_arena") not in sys.path:
+    sys.path.insert(0, os.path.join(KIT_DIR, "practice_arena"))
+
+from practice_arena import PracticeArena, BotStats, TOTAL_TICKS
+
+TUNE_SEEDS = list(range(1, 81))
+VALIDATE_SEEDS = list(range(81, 161))
+FINAL_SEEDS = list(range(161, 241))
 
 
-def run_match_pair(seed, ticks=300):
-    """
-    Run our bot vs sample_bot on a specific seed using run_practice.py.
-    Returns dict mapping bot name to metrics dict.
-    """
-    python_bin = sys.executable
-    cmd = [
-        python_bin,
-        ARENA_SCRIPT,
-        "--bot", f'"{python_bin}" "{MY_BOT_PATH}"',
-        "--bot", f'"{python_bin}" "{SAMPLE_BOT_PATH}"',
-        "--runs", "1",
-        "--seed", str(seed),
-        "--ticks", str(ticks),
+def run_match_instance(args: Tuple[int, List[List[str]], int, str, str]) -> Tuple[int, Dict[int, BotStats]]:
+    seed, commands, ticks, log_dir, arena_module_name = args
+    if arena_module_name == "practice_arena":
+        from practice_arena import PracticeArena as ArenaCls
+    else:
+        import importlib
+        mod = importlib.import_module(arena_module_name)
+        ArenaCls = getattr(mod, "PracticeArena")
+
+    arena = ArenaCls(commands, seed=seed, ticks=ticks, verbose=False, log_dir=log_dir)
+    stats = arena.run()
+    return seed, stats
+
+
+def evaluate_sweep(
+    bot_cmd: List[str],
+    seeds: List[int],
+    ticks: int = TOTAL_TICKS,
+    workers: int = 8,
+    log_dir_prefix: str = "practice_logs/eval",
+    arena_module: str = "practice_arena",
+) -> Tuple[Dict[int, BotStats], float]:
+    """Run bot solo across seeds in parallel."""
+    tasks = [
+        (seed, [bot_cmd], ticks, f"{log_dir_prefix}_{seed}", arena_module)
+        for seed in seeds
     ]
+    t0 = time.time()
+    results: Dict[int, BotStats] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        for seed, stat_dict in executor.map(run_match_instance, tasks):
+            results[seed] = stat_dict[1]
+    elapsed = time.time() - t0
+    return results, elapsed
 
-    # Run the arena match
-    proc = subprocess.run(
-        cmd,
-        cwd=KIT_DIR,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+
+def evaluate_h2h_sweep(
+    bot1_cmd: List[str],
+    bot2_cmd: List[str],
+    seeds: List[int],
+    ticks: int = TOTAL_TICKS,
+    workers: int = 8,
+    log_dir_prefix: str = "practice_logs/h2h",
+    arena_module: str = "practice_arena",
+) -> Tuple[Dict[int, Tuple[BotStats, BotStats]], float]:
+    """Run two bots head-to-head competing on the same map across seeds in parallel."""
+    tasks = [
+        (seed, [bot1_cmd, bot2_cmd], ticks, f"{log_dir_prefix}_{seed}", arena_module)
+        for seed in seeds
+    ]
+    t0 = time.time()
+    results: Dict[int, Tuple[BotStats, BotStats]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        for seed, stat_dict in executor.map(run_match_instance, tasks):
+            results[seed] = (stat_dict[1], stat_dict[2])
+    elapsed = time.time() - t0
+    return results, elapsed
+
+
+def summarize_stats(stats_dict: Dict[int, BotStats]) -> Dict[str, Any]:
+    scores = [s.score for s in stats_dict.values()]
+    collections = [s.collections for s in stats_dict.values()]
+    deposits = [s.deposits for s in stats_dict.values()]
+    caught = [s.captures for s in stats_dict.values()]
+    loot_lost = [s.loot_lost for s in stats_dict.values()]
+    bad_acts = [s.invalid_actions for s in stats_dict.values()]
+    misses = [s.misses for s in stats_dict.values()]
+    max_ms = [s.max_response_ms for s in stats_dict.values()]
+    avg_ms = [s.total_response_ms / max(1, s.answered_ticks) for s in stats_dict.values()]
+    n = len(scores)
+
+    return {
+        "n": n,
+        "mean_score": statistics.mean(scores),
+        "median_score": statistics.median(scores),
+        "std_score": statistics.stdev(scores) if n > 1 else 0.0,
+        "min_score": min(scores),
+        "max_score": max(scores),
+        "mean_collections": statistics.mean(collections),
+        "mean_deposits": statistics.mean(deposits),
+        "mean_caught": statistics.mean(caught),
+        "total_caught": sum(caught),
+        "mean_loot_lost": statistics.mean(loot_lost),
+        "total_bad_acts": sum(bad_acts),
+        "total_misses": sum(misses),
+        "avg_ms": statistics.mean(avg_ms),
+        "peak_max_ms": max(max_ms) if max_ms else 0.0,
+    }
+
+
+def compute_paired_diff(
+    new_stats: Dict[int, BotStats],
+    baseline_stats: Dict[int, BotStats],
+    seeds: List[int],
+) -> Dict[str, Any]:
+    diffs = [new_stats[s].score - baseline_stats[s].score for s in seeds]
+    n = len(diffs)
+    mean_diff = statistics.mean(diffs)
+    median_diff = statistics.median(diffs)
+    std_diff = statistics.stdev(diffs) if n > 1 else 0.0
+    se = std_diff / math.sqrt(n) if n > 1 else 0.0
+    ci_95 = 1.96 * se
+    improved = sum(1 for d in diffs if d > 0)
+    worsened = sum(1 for d in diffs if d < 0)
+    tied = sum(1 for d in diffs if d == 0)
+
+    return {
+        "n": n,
+        "mean_diff": mean_diff,
+        "median_diff": median_diff,
+        "std_diff": std_diff,
+        "ci_95": ci_95,
+        "ci_lower": mean_diff - ci_95,
+        "ci_upper": mean_diff + ci_95,
+        "improved": improved,
+        "worsened": worsened,
+        "tied": tied,
+        "diffs": diffs,
+    }
+
+
+def format_summary_table(label: str, s: Dict[str, Any], elapsed: Optional[float] = None) -> str:
+    t_str = f" in {elapsed:.1f}s" if elapsed is not None else ""
+    lines = [
+        f"--- {label}{t_str} (N={s['n']}) ---",
+        f"Score: Mean=${s['mean_score']:,.1f} | Median=${s['median_score']:,.1f} | Min=${s['min_score']:,.1f} | Max=${s['max_score']:,.1f} | Std=${s['std_score']:,.1f}",
+        f"Ops:   Collections={s['mean_collections']:.1f} | Deposits={s['mean_deposits']:.1f}",
+        f"Safe:  Caught={s['mean_caught']:.2f} (Tot={s['total_caught']}) | LootLost=${s['mean_loot_lost']:,.1f} | BadActs={s['total_bad_acts']} | Misses={s['total_misses']}",
+        f"Time:  AvgMs={s['avg_ms']:.1f}ms | PeakMaxMs={s['peak_max_ms']:.0f}ms",
+    ]
+    return "\n".join(lines)
+
+
+def format_paired_table(label: str, p: Dict[str, Any]) -> str:
+    sign = "+" if p["mean_diff"] >= 0 else ""
+    return (
+        f"Paired Diff ({label}): {sign}${p['mean_diff']:,.1f} ± ${p['ci_95']:,.1f} "
+        f"[95% CI: ${p['ci_lower']:,.1f} to ${p['ci_upper']:,.1f}] | "
+        f"Median: {sign}${p['median_diff']:,.1f} | "
+        f"Win/Loss/Tie: {p['improved']}/{p['worsened']}/{p['tied']} "
+        f"({p['improved']/p['n']*100:.1f}% wins)"
     )
-
-    out = proc.stdout
-    # Parse table lines from output
-    results = {}
-    lines = out.strip().splitlines()
-    in_table = False
-    for line in lines:
-        line_str = line.strip()
-        if line_str.startswith("Bot") and "Score" in line_str and "Collected" in line_str:
-            in_table = True
-            continue
-        if in_table and line_str.startswith("---"):
-            continue
-        if in_table:
-            if not line_str or line_str.startswith("Columns:"):
-                break
-            parts = line_str.split()
-            if len(parts) >= 10:
-                bot_id_label = parts[0]
-                bot_label = "my_bot" if "my_bot" in bot_id_label else "sample_bot"
-                score_str = parts[1].replace(",", "").replace("$", "")
-                try:
-                    score = float(score_str)
-                    collected = float(parts[2].replace(",", ""))
-                    deposits = float(parts[3].replace(",", ""))
-                    caught = float(parts[4].replace(",", ""))
-                    loot_lost = float(parts[5].replace(",", "").replace("$", ""))
-                    bad_acts = float(parts[6].replace(",", ""))
-                    misses = float(parts[7].replace(",", ""))
-                    avg_ms = float(parts[8].replace(",", ""))
-                    max_ms = float(parts[9].replace(",", ""))
-                    results[bot_label] = {
-                        "score": score,
-                        "collected": collected,
-                        "deposits": deposits,
-                        "caught": caught,
-                        "loot_lost": loot_lost,
-                        "bad_acts": bad_acts,
-                        "misses": misses,
-                        "avg_ms": avg_ms,
-                        "max_ms": max_ms,
-                        "disqualified": 1 if "DISQUALIFIED" in line_str else 0,
-                    }
-                except ValueError:
-                    pass
-
-    return results
-
-
-def calculate_stats(scores):
-    if not scores:
-        return {"mean": 0.0, "median": 0.0, "min": 0.0, "max": 0.0, "std": 0.0}
-    mean = statistics.mean(scores)
-    median = statistics.median(scores)
-    min_v = min(scores)
-    max_v = max(scores)
-    std = statistics.stdev(scores) if len(scores) > 1 else 0.0
-    return {"mean": mean, "median": median, "min": min_v, "max": max_v, "std": std}
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Evaluate our bot vs sample_bot across map seeds")
-    parser.add_argument("--start-seed", type=int, default=1, help="First seed (default 1)")
-    parser.add_argument("--end-seed", type=int, default=40, help="Last seed (default 40)")
-    parser.add_argument("--csv", type=str, default="eval_results.csv", help="Output CSV path")
-    parser.add_argument("--ticks", type=int, default=300, help="Match ticks (default 300)")
-    args = parser.parse_args()
-
-    csv_path = os.path.abspath(args.csv)
-    print(f"=== Starting Evaluation Sweep: Seeds {args.start_seed} to {args.end_seed} ===")
-    print(f"  Tuning Set:   seeds 1..20")
-    print(f"  Held-Out Set: seeds 21..40")
-    print(f"  CSV Output:   {csv_path}\n")
-
-    fieldnames = [
-        "seed", "set", "bot", "score", "collected", "deposits",
-        "caught", "loot_lost", "bad_acts", "misses", "max_ms", "disqualified"
-    ]
-
-    all_rows = []
-    # Dicts for grouping scores: data[set_name][bot_name] = [scores...]
-    grouped_scores = {
-        "tuning": defaultdict(list),
-        "held_out": defaultdict(list),
-        "all": defaultdict(list),
-    }
-    grouped_metrics = {
-        "tuning": defaultdict(lambda: defaultdict(list)),
-        "held_out": defaultdict(lambda: defaultdict(list)),
-        "all": defaultdict(lambda: defaultdict(list)),
-    }
-
-    for seed in range(args.start_seed, args.end_seed + 1):
-        set_name = "tuning" if 1 <= seed <= 20 else ("held_out" if 21 <= seed <= 40 else "extra")
-        print(f"Running Match seed={seed:02d} [{set_name.upper()}] ... ", end="", flush=True)
-
-        res = run_match_pair(seed, ticks=args.ticks)
-        if not res:
-            print("FAILED (no output)")
-            continue
-
-        my_res = res.get("my_bot", {})
-        sample_res = res.get("sample_bot", {})
-        print(f"my_bot=${my_res.get('score', 0):,.0f} | sample_bot=${sample_res.get('score', 0):,.0f}")
-
-        for bot_name in ["my_bot", "sample_bot"]:
-            b_data = res.get(bot_name)
-            if not b_data:
-                continue
-            row = {
-                "seed": seed,
-                "set": set_name,
-                "bot": bot_name,
-                "score": b_data["score"],
-                "collected": b_data["collected"],
-                "deposits": b_data["deposits"],
-                "caught": b_data["caught"],
-                "loot_lost": b_data["loot_lost"],
-                "bad_acts": b_data["bad_acts"],
-                "misses": b_data["misses"],
-                "max_ms": b_data["max_ms"],
-                "disqualified": b_data["disqualified"],
-            }
-            all_rows.append(row)
-
-            # Store for stats
-            grouped_scores[set_name][bot_name].append(b_data["score"])
-            grouped_scores["all"][bot_name].append(b_data["score"])
-            for k in ["collected", "deposits", "caught", "loot_lost", "bad_acts", "misses", "max_ms"]:
-                grouped_metrics[set_name][bot_name][k].append(b_data[k])
-                grouped_metrics["all"][bot_name][k].append(b_data[k])
-
-    # Write CSV
-    with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(all_rows)
-
-    print(f"\n[OK] CSV written successfully to: {csv_path}\n")
-
-    # Print summary tables
-    def print_section(section_name, s_key):
-        print("=" * 90)
-        print(f"  {section_name.upper()} SUMMARY TABLE")
-        print("=" * 90)
-        header = f"{'Bot':<12} | {'Mean $':>9} | {'Median $':>9} | {'Min $':>9} | {'Max $':>9} | {'StdDev':>8} | {'Caught':>6} | {'BadActs':>7} | {'Win Rate':>8}"
-        print(header)
-        print("-" * len(header))
-
-        my_scores = grouped_scores[s_key].get("my_bot", [])
-        sample_scores = grouped_scores[s_key].get("sample_bot", [])
-        n_matches = len(my_scores)
-
-        wins = sum(1 for m, s in zip(my_scores, sample_scores) if m > s)
-        win_rate_my = (wins / n_matches * 100.0) if n_matches else 0.0
-        win_rate_sample = (100.0 - win_rate_my) if n_matches else 0.0
-
-        for b_name in ["my_bot", "sample_bot"]:
-            sc = grouped_scores[s_key].get(b_name, [])
-            st = calculate_stats(sc)
-            c = statistics.mean(grouped_metrics[s_key][b_name]["caught"]) if sc else 0.0
-            ba = statistics.mean(grouped_metrics[s_key][b_name]["bad_acts"]) if sc else 0.0
-            wr = win_rate_my if b_name == "my_bot" else win_rate_sample
-            print(f"{b_name:<12} | {st['mean']:>9.1f} | {st['median']:>9.1f} | {st['min']:>9.1f} | {st['max']:>9.1f} | {st['std']:>8.1f} | {c:>6.2f} | {ba:>7.2f} | {wr:>7.1f}%")
-        print("=" * 90 + "\n")
-
-    print_section("Tuning Set (Seeds 1-20)", "tuning")
-    print_section("Held-Out Set (Seeds 21-40)", "held_out")
-    print_section("All Seeds Combined (Seeds 1-40)", "all")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Evaluate bots on TUNE/VALIDATE/FINAL")
+    parser.add_argument("--bot", default="my_bot_v4.py", help="Path to bot script")
+    parser.add_argument("--baseline", default="my_bot_v1.py", help="Path to baseline bot for paired diff")
+    parser.add_argument("--set", choices=["tune", "validate", "both", "final"], default="tune")
+    parser.add_argument("--workers", type=int, default=8, help="Number of parallel workers")
+    parser.add_argument("--mode", choices=["solo", "h2h"], default="solo")
+    parser.add_argument("--opponent", default="Subway_Escape/sample_bot/python/basic_bot.py")
+    args = parser.parse_args()
+
+    python_exe = sys.executable
+    bot_cmd = [python_exe, args.bot]
+
+    if args.set == "tune":
+        seeds = TUNE_SEEDS
+    elif args.set == "validate":
+        seeds = VALIDATE_SEEDS
+    elif args.set == "final":
+        seeds = FINAL_SEEDS
+    else:
+        seeds = TUNE_SEEDS + VALIDATE_SEEDS
+
+    print(f"Running evaluation on {len(seeds)} seeds ({args.set.upper()}) with {args.workers} workers...")
+    stats, elapsed = evaluate_sweep(bot_cmd, seeds, workers=args.workers)
+    summ = summarize_stats(stats)
+    print(format_summary_table(f"{args.bot} on {args.set.upper()}", summ, elapsed))

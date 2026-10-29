@@ -1,0 +1,38 @@
+{
+  "TUNE": {
+    "mean_actual": 19939.986223955715,
+    "mean_bound": 21404.428497447345,
+    "mean_gap": 1464.4422734916309,
+    "gap_pct": 6.841772363444686,
+    "audit": {
+      "mean_score": 19939.986223955715,
+      "mean_spawned": 41390.56483394988,
+      "mean_decay": 2792.8053452922295,
+      "mean_expiry": 18553.17797716029,
+      "mean_capture": 49.74655625262535,
+      "mean_endgame": 54.848731289019284,
+      "mean_idle": 2.25,
+      "mean_traverse": 197.25,
+      "mean_collect": 55.4,
+      "mean_deposit": 44.05
+    }
+  },
+  "VALIDATE": {
+    "mean_actual": 18218.783516321626,
+    "mean_bound": 19971.72279644092,
+    "mean_gap": 1752.9392801192946,
+    "gap_pct": 8.77710600124932,
+    "audit": {
+      "mean_score": 18218.783516321626,
+      "mean_spawned": 39443.72738121916,
+      "mean_decay": 2671.1736567831135,
+      "mean_expiry": 18509.199586602743,
+      "mean_capture": 19.57062151167516,
+      "mean_endgame": 25.0,
+      "mean_idle": 3.1,
+      "mean_traverse": 203.7,
+      "mean_collect": 52.35,
+      "mean_deposit": 40.3
+    }
+  }
+}
