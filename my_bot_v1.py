@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Subway Escape - Antigravity Autonomous Bot
-OptimatX Club ┬╖ IIT Patna (Celesta) ┬╖ AI ├ù Maths Hackathon
+OptimatX Club · IIT Patna (Celesta) · AI × Maths Hackathon
 Phase 1: Robust I/O Shell + Adapter + Anti-DQ Fallback
 """
 
